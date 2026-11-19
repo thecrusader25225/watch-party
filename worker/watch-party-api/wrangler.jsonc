@@ -10,7 +10,7 @@
   "vars": {
     "FIREBASE_PROJECT_ID": "personal25225",
     "FIREBASE_DATABASE_URL": "https://personal25225-default-rtdb.europe-west1.firebasedatabase.app",
-    "APP_ORIGIN": "http://localhost:5173"
+    "APP_ORIGIN": "https://watch-party-one-livid.vercel.app"
   },
   "r2_buckets": [
     {

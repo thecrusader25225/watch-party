@@ -33,6 +33,7 @@ function corsHeaders(request, env) {
 
   const allowedOrigins = [
     env.APP_ORIGIN,
+	"https://watch-party-one-livid.vercel.app",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
   ].filter(Boolean);

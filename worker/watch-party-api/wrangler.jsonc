@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "watch-party-api",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-18",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "FIREBASE_PROJECT_ID": "personal25225",
+    "FIREBASE_DATABASE_URL": "https://personal25225-default-rtdb.europe-west1.firebasedatabase.app",
+    "APP_ORIGIN": "http://localhost:5173"
+  },
+  "r2_buckets": [
+    {
+      "binding": "MEDIA_BUCKET",
+      "bucket_name": "watch-party-media"
+    }
+  ]
+}

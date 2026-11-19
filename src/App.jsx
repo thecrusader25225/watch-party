@@ -1365,8 +1365,7 @@ function WatchParty() {
 
     try {
 
-      beginLoading("Sending message");
-    const messageRef = push(
+      const messageRef = push(
 
         ref(db, `rooms/${currentRoomRef.current}/messages`),
 
@@ -1390,9 +1389,6 @@ function WatchParty() {
 
       setNotice(`Couldn't send message: ${error.message}`);
 
-    }
-    finally {
-      endLoading();
     }
   };
 

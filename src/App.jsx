@@ -29,6 +29,7 @@ import {
   Plus,
   ArrowRight,
   Library,
+  Captions,
 } from "lucide-react";
 import { isFirebaseConfigured, auth, db } from "./firebase";
 import { onAuthStateChanged, signInAnonymously } from "firebase/auth";
@@ -55,6 +56,18 @@ const makeClientId = () => crypto.randomUUID().replaceAll("-", "");
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 const formatBytes = (bytes) =>
   `${(Number(bytes || 0) / (1024 * 1024)).toFixed(1)} MB`;
+const isVideoObject = (item) =>
+  /\.(mp4|m4v|mov|webm|mkv|avi|ogv)$/i.test(item?.name || item?.key || "");
+const srtToVtt = (input) => {
+  const normalized = input
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n?/g, "\n")
+    .trim();
+  const body = normalized
+    .replace(/^\s*\d+\s*\n/gm, "")
+    .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2");
+  return `WEBVTT\n\n${body}\n`;
+};
 
 function App() {
   return (
@@ -85,6 +98,9 @@ function WatchParty() {
   const [messages, setMessages] = useState([]);
   const [chatInput, setChatInput] = useState("");
   const [videoUrl, setVideoUrl] = useState("");
+  const [subtitleUrl, setSubtitleUrl] = useState("");
+  const [activeSubtitle, setActiveSubtitle] = useState(null);
+  const [subtitleUploading, setSubtitleUploading] = useState(false);
   const [remoteMedia, setRemoteMedia] = useState(null);
   const [library, setLibrary] = useState([]);
   const [activeMediaId, setActiveMediaId] = useState(null);
@@ -97,6 +113,7 @@ function WatchParty() {
   const [rightCollapsed, setRightCollapsed] = useState(false);
   const videoRef = useRef(null);
   const fileInputRef = useRef(null);
+  const subtitleInputRef = useRef(null);
   const chatEndRef = useRef(null);
   const clientIdRef = useRef(makeClientId());
   const joinedRef = useRef(false);
@@ -169,6 +186,16 @@ function WatchParty() {
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+  useEffect(() => {
+    if (
+      activeSubtitle &&
+      activeMediaId &&
+      activeSubtitle.videoKey !== activeMediaId
+    ) {
+      setActiveSubtitle(null);
+      setSubtitleUrl("");
+    }
+  }, [activeMediaId, activeSubtitle]);
 
   const stopRoomListeners = useCallback(() => {
     unsubscribersRef.current.forEach((stop) => stop());
@@ -318,14 +345,124 @@ function WatchParty() {
       throw new Error(
         result.error || `Library request failed: HTTP ${response.status}`,
       );
-    const items = (result.videos || []).map((video) => ({
-      ...video,
-      id: video.key,
-    }));
+    const items = (result.videos || [])
+      .filter(isVideoObject)
+      .map((video) => ({ ...video, id: video.key }));
     libraryItemsRef.current = items;
     setLibrary(items);
     return items;
   }, []);
+
+  const loadSubtitleTrack = useCallback(async (subtitle, user, targetRoom) => {
+    if (!subtitle?.key || !user || !targetRoom || !WORKER_URL) {
+      setSubtitleUrl("");
+      setActiveSubtitle(null);
+      return;
+    }
+    try {
+      const token = await user.getIdToken();
+      const response = await fetch(`${WORKER_URL}/playback-url`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ roomId: targetRoom, key: subtitle.key }),
+      });
+      const result = await response.json();
+      if (!response.ok)
+        throw new Error(result.error || "Could not retrieve subtitle URL");
+      if (currentRoomRef.current !== targetRoom) return;
+      setActiveSubtitle(subtitle);
+      setSubtitleUrl(result.playbackUrl);
+    } catch (error) {
+      console.error("Subtitle URL request failed:", error);
+      if (currentRoomRef.current === targetRoom) {
+        setSubtitleUrl("");
+        setNotice(`Couldn't load subtitles: ${error.message}`);
+      }
+    }
+  }, []);
+
+  const uploadSubtitle = async (selected) => {
+    if (!selected || !currentRoomRef.current || !firebaseUser || !activeMediaId)
+      return;
+    if (role !== "host")
+      return setNotice("Only the host can upload subtitles.");
+    if (!/\.(srt|vtt)$/i.test(selected.name))
+      return setNotice("Choose an .srt or .vtt subtitle file.");
+    if (selected.size > 5 * 1024 * 1024)
+      return setNotice("Subtitle files must be smaller than 5 MB.");
+    if (!WORKER_URL)
+      return setNotice("VITE_WORKER_URL is missing from your frontend .env.");
+
+    const targetRoom = currentRoomRef.current;
+    const videoKey = activeMediaId;
+    setSubtitleUploading(true);
+    setNotice("Preparing subtitle upload...");
+    try {
+      let subtitleBlob;
+      let subtitleName = selected.name.replace(/\.srt$/i, ".vtt");
+      if (/\.srt$/i.test(selected.name)) {
+        subtitleBlob = new Blob([srtToVtt(await selected.text())], {
+          type: "text/vtt; charset=utf-8",
+        });
+      } else {
+        const text = (await selected.text()).replace(/^\uFEFF/, "");
+        if (!/^WEBVTT(?:\s|$)/i.test(text.trimStart()))
+          throw new Error("This .vtt file is missing its WEBVTT header.");
+        subtitleBlob = new Blob([text], { type: "text/vtt; charset=utf-8" });
+      }
+      const token = await firebaseUser.getIdToken();
+      const contentType = "text/vtt; charset=utf-8";
+      const response = await fetch(`${WORKER_URL}/upload-url`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          roomId: targetRoom,
+          filename: subtitleName,
+          contentType,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok)
+        throw new Error(result.error || "Could not create subtitle upload URL");
+      await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("PUT", result.uploadUrl);
+        xhr.setRequestHeader("Content-Type", contentType);
+        xhr.onload = () =>
+          xhr.status >= 200 && xhr.status < 300
+            ? resolve()
+            : reject(
+                new Error(`R2 subtitle upload failed: HTTP ${xhr.status}`),
+              );
+        xhr.onerror = () =>
+          reject(new Error("Network error while uploading subtitles to R2"));
+        xhr.send(subtitleBlob);
+      });
+      if (currentRoomRef.current !== targetRoom || activeMediaId !== videoKey)
+        return;
+      const subtitleData = {
+        key: result.key,
+        name: subtitleName,
+        language: "en",
+        videoKey,
+        updatedAt: Date.now(),
+        updatedBy: firebaseUser.uid,
+      };
+      await set(ref(db, `rooms/${targetRoom}/activeSubtitle`), subtitleData);
+      setNotice("Subtitles uploaded and shared with the room.");
+    } catch (error) {
+      console.error("Subtitle upload failed:", error);
+      setNotice(`Subtitle upload failed: ${error.message}`);
+    } finally {
+      setSubtitleUploading(false);
+    }
+  };
 
   const selectLibraryVideo = useCallback(
     async (item) => {
@@ -342,6 +479,10 @@ function WatchParty() {
           changedAt: Date.now(),
           changedBy: firebaseUser?.uid || null,
         });
+        await set(
+          ref(db, `rooms/${currentRoomRef.current}/activeSubtitle`),
+          null,
+        );
         await set(ref(db, `rooms/${currentRoomRef.current}/playback`), {
           status: "paused",
           position: 0,
@@ -421,6 +562,7 @@ function WatchParty() {
         changedAt: Date.now(),
         changedBy: firebaseUser.uid,
       });
+      await set(ref(db, `rooms/${targetRoom}/activeSubtitle`), null);
       await set(ref(db, `rooms/${targetRoom}/playback`), {
         status: "paused",
         position: 0,
@@ -544,6 +686,10 @@ function WatchParty() {
           }
           const selectedKey = selection.mediaId;
           setActiveMediaId(selectedKey);
+          setActiveSubtitle((current) =>
+            current && current.videoKey !== selectedKey ? null : current,
+          );
+          setSubtitleUrl((currentUrl) => currentUrl);
           try {
             let media = libraryItemsRef.current.find(
               (item) => item.key === selectedKey,
@@ -572,6 +718,19 @@ function WatchParty() {
         },
         (error) => setNotice(`Active video listener: ${error.message}`),
       );
+      const stopActiveSubtitle = onValue(
+        ref(db, `rooms/${normalized}/activeSubtitle`),
+        async (snapshot) => {
+          const subtitle = snapshot.val();
+          if (!subtitle?.key) {
+            setSubtitleUrl("");
+            setActiveSubtitle(null);
+            return;
+          }
+          await loadSubtitleTrack(subtitle, credential, normalized);
+        },
+        (error) => setNotice(`Subtitle listener: ${error.message}`),
+      );
       const stopMessages = onValue(
         query(ref(db, `rooms/${normalized}/messages`), limitToLast(150)),
         (snapshot) => {
@@ -590,6 +749,7 @@ function WatchParty() {
         stopState,
         stopMembers,
         stopActiveMedia,
+        stopActiveSubtitle,
         stopMessages,
       ];
       setJoined(true);
@@ -731,7 +891,7 @@ function WatchParty() {
     *{box-sizing:border-box} :root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#ececf2;background:#09090d;font-synthesis:none}
     body{margin:0;min-width:320px;background:radial-gradient(ellipse at 50% -25%,#242039 0%,#101017 43%,#09090d 78%)} button,input{font:inherit} button{cursor:pointer}
     .wp{min-height:100vh;color:#eeeef4}.topbar{height:68px;border-bottom:1px solid #ffffff12;background:#0b0b10dd;backdrop-filter:blur(18px);display:flex;align-items:center;justify-content:space-between;padding:0 28px;position:sticky;top:0;z-index:20}
-    .brand{display:flex;align-items:center;gap:10px;color:#f7f5ff;text-decoration:none;font-weight:850;letter-spacing:-.8px;font-size:21px}.brandmark{width:34px;height:34px;display:grid;place-items:center;border-radius:11px;background:#8b5cf6;color:white}.accent{color:#a78bfa}.topright{display:flex;align-items:center;gap:12px;color:#a4a1b2;font-size:12px}.dot{width:7px;height:7px;border-radius:50%;background:#686575;display:inline-block}.dot.online{background:#4ade80;box-shadow:0 0 12px #4ade8080}.btn{border:1px solid #ffffff18;background:#ffffff0a;color:#eeeef4;border-radius:10px;padding:10px 13px;display:inline-flex;align-items:center;justify-content:center;gap:8px;font-size:13px;font-weight:650;transition:.18s}.btn:hover{background:#ffffff15;border-color:#ffffff35}.btn:disabled{opacity:.45;cursor:not-allowed}.btn.primary{background:#8155e8;border-color:#936df0;color:white}.btn.primary:hover{background:#936df0}.btn.icon{width:38px;height:38px;padding:0}.home{max-width:1120px;margin:0 auto;padding:clamp(38px,8vh,90px) 24px;display:grid;grid-template-columns:minmax(0,1fr) minmax(290px,370px);gap:54px;align-items:start}.home-main{padding-top:30px}.wordmark{font-size:clamp(42px,7vw,76px);line-height:1;font-weight:850;letter-spacing:-5px;margin:0 0 12px}.tagline{color:#a5a1b4;margin:0 0 38px;font-size:15px}.home-form{max-width:490px;display:grid;gap:13px}.field{display:grid;gap:7px}.field label{font-size:10px;letter-spacing:1.2px;font-weight:800;color:#a7a2b5}.field input,.chat-form input{background:#15141d;border:1px solid #ffffff17;border-radius:11px;padding:14px 15px;color:#f5f3ff;outline:none;width:100%}.field input:focus,.chat-form input:focus{border-color:#9b7af0;box-shadow:0 0 0 3px #8b5cf622}.home-actions{display:flex;gap:10px;margin-top:4px}.home-actions .btn{flex:1;min-height:45px}.rooms-panel{border:1px solid #ffffff14;background:#111119d9;border-radius:18px;overflow:hidden;box-shadow:0 25px 80px #0005}.panel-head{padding:18px 18px 14px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #ffffff10}.panel-head h3{font-size:14px;margin:0}.muted{color:#858194}.room-list{max-height:470px;overflow:auto;padding:8px}.room-link{width:100%;text-align:left;border:0;background:transparent;color:#eeeef4;border-radius:10px;padding:12px;display:flex;align-items:center;justify-content:space-between;gap:12px}.room-link:hover{background:#ffffff0b}.room-link strong{display:block;font-size:13px}.room-link small{display:block;color:#858194;font-size:11px;margin-top:4px}.empty-rooms{padding:28px 18px;text-align:center;color:#898597;font-size:12px;line-height:1.6}.notice{margin:14px 0 0;padding:11px 13px;border:1px solid #f59e0b33;background:#f59e0b0d;color:#f6ca82;border-radius:10px;font-size:12px;display:flex;gap:8px;align-items:flex-start;overflow-wrap:anywhere}.room-page{height:calc(100vh - 68px);min-height:520px;display:flex;flex-direction:column}.room-head{padding:13px 20px;display:flex;align-items:center;justify-content:space-between;gap:16px;border-bottom:1px solid #ffffff12}.room-title{min-width:0}.room-title .kicker{color:#8d879e;font-size:9px;font-weight:800;letter-spacing:1.3px;margin:0 0 4px}.room-title h1{font-size:18px;margin:0;letter-spacing:-.3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.room-title h1 span{color:#a78bfa}.room-actions{display:flex;align-items:center;gap:8px}.room-meta{display:flex;align-items:center;gap:12px;color:#9691a5;font-size:11px}.workspace{flex:1;min-height:0;display:flex;gap:0;padding:14px;overflow:hidden}.side{flex:0 0 260px;min-width:0;background:#111119;border:1px solid #ffffff12;border-radius:14px;display:flex;flex-direction:column;overflow:hidden;transition:flex-basis .22s ease,width .22s ease}.side.right{flex-basis:285px}.side.collapsed{flex-basis:54px}.side-section{display:flex;flex-direction:column;min-height:0;flex:1;padding:12px}.side-section+ .side-section{border-top:1px solid #ffffff12}.side-section.members{flex:0 0 48%}.side-section.chat{flex:1}.side.collapsed .side-section{align-items:center;padding:10px 6px}.side-head{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:12px;min-height:30px}.side-head h3{font-size:12px;margin:0;white-space:nowrap}.side.collapsed .side-head{justify-content:center}.collapse-btn{border:0;background:transparent;color:#9691a5;padding:5px;border-radius:7px;display:grid;place-items:center}.collapse-btn:hover{background:#ffffff12;color:white}.side.collapsed .side-content{display:none}.member-list,.video-list{overflow:auto;min-height:0;display:grid;align-content:start;gap:5px}.member{display:flex;align-items:center;gap:9px;padding:8px;border-radius:9px;background:#ffffff05}.avatar{width:28px;height:28px;border-radius:9px;background:#30254b;color:#c9b7ff;display:grid;place-items:center;font-size:11px;font-weight:800;flex:none}.member-name{min-width:0;flex:1}.member-name strong{font-size:11px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.member-name small{font-size:10px;color:#858194}.you{font-size:9px;color:#a78bfa}.chat-messages{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:11px;padding:2px 1px 10px}.chat-msg{font-size:11px;line-height:1.45;overflow-wrap:anywhere}.chat-msg .sender{color:#b8a1ff;font-weight:750;margin-right:5px}.chat-msg time{color:#686477;font-size:9px;margin-left:5px}.chat-form{display:flex;gap:6px;padding-top:8px;border-top:1px solid #ffffff10}.chat-form input{padding:10px;font-size:11px;min-width:0}.chat-form button{width:36px;flex:none;padding:0}.center{flex:1;min-width:0;display:flex;flex-direction:column;padding:0 12px;gap:10px}.player-wrap{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;background:#050507;border:1px solid #ffffff12;border-radius:14px;overflow:hidden;position:relative}.player-wrap video{width:100%;height:100%;max-height:100%;object-fit:contain;background:#000}.empty-player{padding:30px;text-align:center;max-width:390px}.empty-player .upload-symbol{width:58px;height:58px;border-radius:18px;background:#8b5cf622;color:#bba5ff;display:grid;place-items:center;margin:0 auto 17px}.empty-player h2{font-size:18px;margin:0 0 8px}.empty-player p{font-size:12px;line-height:1.6;color:#8f8a9e;margin:0 0 17px}.player-caption{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#9994a8;font-size:11px;min-height:32px}.player-caption strong{color:#e9e5f2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.upload-progress{height:4px;background:#ffffff14;border-radius:10px;overflow:hidden}.upload-progress>span{height:100%;display:block;background:#9b7af0}.side.right .side-section{flex:1}.video-item{width:100%;border:1px solid transparent;background:#ffffff05;color:#eeeef4;text-align:left;padding:9px;border-radius:10px;display:flex;align-items:center;gap:9px}.video-item:hover{background:#ffffff0d}.video-item.active{background:#8b5cf61b;border-color:#8b5cf655}.video-icon{width:38px;height:34px;display:grid;place-items:center;background:#24212e;border-radius:7px;color:#b7a1ff;flex:none}.video-info{min-width:0;flex:1}.video-info strong{display:block;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.video-info small{display:block;color:#858194;font-size:9px;margin-top:4px}.selected-label{color:#bba5ff;font-size:9px}.side-empty{padding:24px 8px;text-align:center;color:#777286;font-size:11px;line-height:1.6}.side-empty svg{display:block;margin:0 auto 9px}.collapsed-rail{display:none}.side.collapsed .collapsed-rail{display:flex;flex-direction:column;gap:14px;align-items:center;color:#a69db9;padding-top:8px}.footerline{padding:7px 18px;color:#6f6a7e;font-size:10px;border-top:1px solid #ffffff0c;display:flex;justify-content:space-between}.mobile-label{display:none}
+    .brand{display:flex;align-items:center;gap:10px;color:#f7f5ff;text-decoration:none;font-weight:850;letter-spacing:-.8px;font-size:21px}.brandmark{width:34px;height:34px;display:grid;place-items:center;border-radius:11px;background:#8b5cf6;color:white}.accent{color:#a78bfa}.topright{display:flex;align-items:center;gap:12px;color:#a4a1b2;font-size:12px}.dot{width:7px;height:7px;border-radius:50%;background:#686575;display:inline-block}.dot.online{background:#4ade80;box-shadow:0 0 12px #4ade8080}.btn{border:1px solid #ffffff18;background:#ffffff0a;color:#eeeef4;border-radius:10px;padding:10px 13px;display:inline-flex;align-items:center;justify-content:center;gap:8px;font-size:13px;font-weight:650;transition:.18s}.btn:hover{background:#ffffff15;border-color:#ffffff35}.btn:disabled{opacity:.45;cursor:not-allowed}.btn.primary{background:#8155e8;border-color:#936df0;color:white}.btn.primary:hover{background:#936df0}.btn.icon{width:38px;height:38px;padding:0}.home{max-width:1120px;margin:0 auto;padding:clamp(38px,8vh,90px) 24px;display:grid;grid-template-columns:minmax(0,1fr) minmax(290px,370px);gap:54px;align-items:start}.home-main{padding-top:30px}.wordmark{font-size:clamp(42px,7vw,76px);line-height:1;font-weight:850;letter-spacing:-5px;margin:0 0 12px}.tagline{color:#a5a1b4;margin:0 0 38px;font-size:15px}.home-form{max-width:490px;display:grid;gap:13px}.field{display:grid;gap:7px}.field label{font-size:10px;letter-spacing:1.2px;font-weight:800;color:#a7a2b5}.field input,.chat-form input{background:#15141d;border:1px solid #ffffff17;border-radius:11px;padding:14px 15px;color:#f5f3ff;outline:none;width:100%}.field input:focus,.chat-form input:focus{border-color:#9b7af0;box-shadow:0 0 0 3px #8b5cf622}.home-actions{display:flex;gap:10px;margin-top:4px}.home-actions .btn{flex:1;min-height:45px}.rooms-panel{border:1px solid #ffffff14;background:#111119d9;border-radius:18px;overflow:hidden;box-shadow:0 25px 80px #0005}.panel-head{padding:18px 18px 14px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #ffffff10}.panel-head h3{font-size:14px;margin:0}.muted{color:#858194}.room-list{max-height:470px;overflow:auto;padding:8px}.room-link{width:100%;text-align:left;border:0;background:transparent;color:#eeeef4;border-radius:10px;padding:12px;display:flex;align-items:center;justify-content:space-between;gap:12px}.room-link:hover{background:#ffffff0b}.room-link strong{display:block;font-size:13px}.room-link small{display:block;color:#858194;font-size:11px;margin-top:4px}.empty-rooms{padding:28px 18px;text-align:center;color:#898597;font-size:12px;line-height:1.6}.notice{margin:14px 0 0;padding:11px 13px;border:1px solid #f59e0b33;background:#f59e0b0d;color:#f6ca82;border-radius:10px;font-size:12px;display:flex;gap:8px;align-items:flex-start;overflow-wrap:anywhere}.room-page{height:calc(100vh - 68px);min-height:520px;display:flex;flex-direction:column}.room-head{padding:13px 20px;display:flex;align-items:center;justify-content:space-between;gap:16px;border-bottom:1px solid #ffffff12}.room-title{min-width:0}.room-title .kicker{color:#8d879e;font-size:9px;font-weight:800;letter-spacing:1.3px;margin:0 0 4px}.room-title h1{font-size:18px;margin:0;letter-spacing:-.3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.room-title h1 span{color:#a78bfa}.room-actions{display:flex;align-items:center;gap:8px}.room-meta{display:flex;align-items:center;gap:12px;color:#9691a5;font-size:11px}.workspace{flex:1;min-height:0;display:flex;gap:0;padding:14px;overflow:hidden}.side{flex:0 0 260px;min-width:0;background:#111119;border:1px solid #ffffff12;border-radius:14px;display:flex;flex-direction:column;overflow:hidden;transition:flex-basis .22s ease,width .22s ease}.side.right{flex-basis:285px}.side.collapsed{flex-basis:54px}.side-section{display:flex;flex-direction:column;min-height:0;flex:1;padding:12px}.side-section+ .side-section{border-top:1px solid #ffffff12}.side-section.members{flex:0 0 48%}.side-section.chat{flex:1}.side.collapsed .side-section{align-items:center;padding:10px 6px}.side-head{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:12px;min-height:30px}.side-head h3{font-size:12px;margin:0;white-space:nowrap}.side.collapsed .side-head{justify-content:center}.collapse-btn{border:0;background:transparent;color:#9691a5;padding:5px;border-radius:7px;display:grid;place-items:center}.collapse-btn:hover{background:#ffffff12;color:white}.side.collapsed .side-content{display:none}.member-list,.video-list{overflow:auto;min-height:0;display:grid;align-content:start;gap:5px}.member{display:flex;align-items:center;gap:9px;padding:8px;border-radius:9px;background:#ffffff05}.avatar{width:28px;height:28px;border-radius:9px;background:#30254b;color:#c9b7ff;display:grid;place-items:center;font-size:11px;font-weight:800;flex:none}.member-name{min-width:0;flex:1}.member-name strong{font-size:11px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.member-name small{font-size:10px;color:#858194}.you{font-size:9px;color:#a78bfa}.chat-messages{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:11px;padding:2px 1px 10px}.chat-msg{font-size:11px;line-height:1.45;overflow-wrap:anywhere}.chat-msg .sender{color:#b8a1ff;font-weight:750;margin-right:5px}.chat-msg time{color:#686477;font-size:9px;margin-left:5px}.chat-form{display:flex;gap:6px;padding-top:8px;border-top:1px solid #ffffff10}.chat-form input{padding:10px;font-size:11px;min-width:0}.chat-form button{width:36px;flex:none;padding:0}.center{flex:1;min-width:0;display:flex;flex-direction:column;padding:0 12px;gap:10px}.player-wrap{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;background:#050507;border:1px solid #ffffff12;border-radius:14px;overflow:hidden;position:relative}.player-wrap video{width:100%;height:100%;max-height:100%;object-fit:contain;background:#000}.empty-player{padding:30px;text-align:center;max-width:390px}.empty-player .upload-symbol{width:58px;height:58px;border-radius:18px;background:#8b5cf622;color:#bba5ff;display:grid;place-items:center;margin:0 auto 17px}.empty-player h2{font-size:18px;margin:0 0 8px}.empty-player p{font-size:12px;line-height:1.6;color:#8f8a9e;margin:0 0 17px}.player-caption{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#9994a8;font-size:11px;min-height:32px}.player-caption strong{color:#e9e5f2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.player-caption .collapse-btn{display:inline-flex;align-items:center;gap:5px;color:#bba5ff;font-size:10px;padding:5px 7px;border:1px solid #ffffff18;border-radius:7px}.upload-progress{height:4px;background:#ffffff14;border-radius:10px;overflow:hidden}.upload-progress>span{height:100%;display:block;background:#9b7af0}.side.right .side-section{flex:1}.video-item{width:100%;border:1px solid transparent;background:#ffffff05;color:#eeeef4;text-align:left;padding:9px;border-radius:10px;display:flex;align-items:center;gap:9px}.video-item:hover{background:#ffffff0d}.video-item.active{background:#8b5cf61b;border-color:#8b5cf655}.video-icon{width:38px;height:34px;display:grid;place-items:center;background:#24212e;border-radius:7px;color:#b7a1ff;flex:none}.video-info{min-width:0;flex:1}.video-info strong{display:block;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.video-info small{display:block;color:#858194;font-size:9px;margin-top:4px}.selected-label{color:#bba5ff;font-size:9px}.side-empty{padding:24px 8px;text-align:center;color:#777286;font-size:11px;line-height:1.6}.side-empty svg{display:block;margin:0 auto 9px}.collapsed-rail{display:none}.side.collapsed .collapsed-rail{display:flex;flex-direction:column;gap:14px;align-items:center;color:#a69db9;padding-top:8px}.footerline{padding:7px 18px;color:#6f6a7e;font-size:10px;border-top:1px solid #ffffff0c;display:flex;justify-content:space-between}.mobile-label{display:none}
     @media(max-width:900px){.side{flex-basis:220px}.side.right{flex-basis:230px}.side.collapsed,.side.right.collapsed{flex-basis:48px}.workspace{padding:9px}.center{padding:0 8px}}
     @media(max-width:680px){.topbar{padding:0 15px}.home{grid-template-columns:1fr;gap:24px;padding:45px 17px}.home-main{padding-top:0}.wordmark{letter-spacing:-3px}.room-page{height:auto;min-height:calc(100vh - 68px)}.room-head{padding:12px}.room-meta{display:none}.workspace{display:grid;grid-template-columns:1fr;overflow:visible;padding:8px;gap:8px}.center{order:1;padding:0;min-height:45vh}.side.left{order:2;flex-basis:auto!important;display:grid;grid-template-columns:1fr 1fr;min-height:270px}.side.right{order:3;flex-basis:auto!important;min-height:180px}.side.collapsed{display:none}.side-section.members{flex:1}.side-section.chat{flex:1;border-top:0;border-left:1px solid #ffffff12}.room-actions .btn span{display:none}.room-actions .btn{padding:10px}.player-wrap{min-height:42vh}.footerline{font-size:9px}}
   `;
@@ -1038,6 +1198,7 @@ function WatchParty() {
                   src={videoUrl}
                   controls
                   playsInline
+                  crossOrigin="anonymous"
                   onLoadedMetadata={() => {
                     if (latestStateRef.current)
                       applyState(latestStateRef.current, true);
@@ -1047,7 +1208,19 @@ function WatchParty() {
                   onSeeked={onSeeked}
                   onRateChange={onRateChange}
                   onEnded={() => publishState("paused")}
-                />
+                >
+                  {subtitleUrl &&
+                    activeSubtitle?.videoKey === activeMediaId && (
+                      <track
+                        key={activeSubtitle.key}
+                        kind="subtitles"
+                        src={subtitleUrl}
+                        srcLang={activeSubtitle.language || "en"}
+                        label={activeSubtitle.name || "Subtitles"}
+                        default
+                      />
+                    )}
+                </video>
               ) : (
                 <div className="empty-player">
                   <div className="upload-symbol">
@@ -1091,9 +1264,39 @@ function WatchParty() {
                 e.target.value = "";
               }}
             />
+            <input
+              ref={subtitleInputRef}
+              type="file"
+              accept=".srt,.vtt,text/vtt,application/x-subrip"
+              hidden
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) uploadSubtitle(file);
+                e.target.value = "";
+              }}
+            />
             <div className="player-caption">
               <strong>{remoteMedia?.name || "Nothing playing"}</strong>
-              <span>
+              <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                {activeSubtitle ? (
+                  <span>
+                    <Captions size={13} style={{ verticalAlign: "-2px" }} />{" "}
+                    {activeSubtitle.name}
+                  </span>
+                ) : (
+                  <span>No subtitles</span>
+                )}
+                {role === "host" && videoUrl && (
+                  <button
+                    className="collapse-btn"
+                    onClick={() => subtitleInputRef.current?.click()}
+                    disabled={subtitleUploading}
+                    title="Upload .SRT or .VTT subtitles"
+                  >
+                    <Captions size={16} />
+                    {subtitleUploading ? "Uploading…" : "Add subtitles"}
+                  </button>
+                )}
                 {playing ? (
                   <>
                     <Play

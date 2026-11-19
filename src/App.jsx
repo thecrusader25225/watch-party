@@ -649,8 +649,9 @@ function WatchParty() {
     const metadata = metadataSnapshot.val() || {};
 
     const items = (result.videos || []).map((video) => {
-      const metadataKey = String(video.key || "").replaceAll("/", "__");
-      const savedMetadata = metadata[metadataKey] || {};
+const metadataKey = encodeURIComponent(video.key)
+  .replaceAll(".", "%2E");
+        const savedMetadata = metadata[metadataKey] || {};
       return {
         ...video,
         ...savedMetadata,

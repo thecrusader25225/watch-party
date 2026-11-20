@@ -60,6 +60,10 @@ import {
 
   Library,
 
+  Pencil,
+
+  Trash2,
+
 } from "lucide-react";
 
 import { isFirebaseConfigured, auth, db } from "./firebase";
@@ -109,6 +113,13 @@ const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 const formatBytes = (bytes) =>
 
   `${(Number(bytes || 0) / (1024 * 1024)).toFixed(1)} MB`;
+
+// Firebase Realtime Database keys cannot contain ., #, $, [, ], or /.
+const getMetadataKey = (key) =>
+  encodeURIComponent(String(key || "")).replaceAll(".", "%2E");
+
+// Supports metadata written by earlier versions of the app.
+const getLegacyMetadataKey = (key) => String(key || "").replaceAll("/", "__");
 
 function App() {
 
@@ -649,9 +660,9 @@ function WatchParty() {
     const metadata = metadataSnapshot.val() || {};
 
     const items = (result.videos || []).map((video) => {
-const metadataKey = encodeURIComponent(video.key)
-  .replaceAll(".", "%2E");
-        const savedMetadata = metadata[metadataKey] || {};
+const metadataKey = getMetadataKey(video.key);
+        const legacyMetadataKey = getLegacyMetadataKey(video.key);
+        const savedMetadata = metadata[metadataKey] || metadata[legacyMetadataKey] || {};
       return {
         ...video,
         ...savedMetadata,
@@ -838,7 +849,8 @@ const metadataKey = encodeURIComponent(video.key)
         throw new Error("You left the room before the upload completed.");
 
       // Persist the original filename separately from the opaque R2 object key.
-      const metadataKey = String(result.key).replaceAll("/", "__");
+      if (!result.key) throw new Error("Upload URL response did not include the R2 object key.");
+      const metadataKey = getMetadataKey(result.key);
       await set(ref(db, `rooms/${targetRoom}/mediaMetadata/${metadataKey}`), {
         name: selected.name,
         size: selected.size,
@@ -914,10 +926,14 @@ const metadataKey = encodeURIComponent(video.key)
 
     const targetRoom = currentRoomRef.current;
     if (!targetRoom || !firebaseUser) return;
-    const metadataKey = String(item.key).replaceAll("/", "__");
+    const metadataKey = getMetadataKey(item.key);
+    const legacyMetadataKey = getLegacyMetadataKey(item.key);
     beginLoading("Renaming video");
     try {
       await set(ref(db, `rooms/${targetRoom}/mediaMetadata/${metadataKey}/name`), cleanName);
+      if (legacyMetadataKey !== metadataKey) {
+        await remove(ref(db, `rooms/${targetRoom}/mediaMetadata/${legacyMetadataKey}`));
+      }
       const updated = libraryItemsRef.current.map((video) =>
         video.key === item.key ? { ...video, name: cleanName } : video
       );
@@ -955,8 +971,12 @@ const metadataKey = encodeURIComponent(video.key)
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Could not delete video");
 
-      const metadataKey = String(item.key).replaceAll("/", "__");
+      const metadataKey = getMetadataKey(item.key);
+      const legacyMetadataKey = getLegacyMetadataKey(item.key);
       await remove(ref(db, `rooms/${targetRoom}/mediaMetadata/${metadataKey}`));
+      if (legacyMetadataKey !== metadataKey) {
+        await remove(ref(db, `rooms/${targetRoom}/mediaMetadata/${legacyMetadataKey}`));
+      }
 
       if (activeMediaId === item.key) {
         await remove(ref(db, `rooms/${targetRoom}/activeMedia`));
@@ -1179,10 +1199,11 @@ const metadataKey = encodeURIComponent(video.key)
         (snapshot) => {
           const metadata = snapshot.val() || {};
           const updated = libraryItemsRef.current.map((item) => {
-            const metadataKey = String(item.key || "").replaceAll("/", "__");
+            const metadataKey = getMetadataKey(item.key);
+            const legacyMetadataKey = getLegacyMetadataKey(item.key);
             return {
               ...item,
-              name: metadata[metadataKey]?.name || item.name,
+              name: metadata[metadataKey]?.name || metadata[legacyMetadataKey]?.name || item.name,
             };
           });
           libraryItemsRef.current = updated;

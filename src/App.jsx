@@ -89,6 +89,8 @@ import {
 
   get,
 
+  runTransaction,
+
 } from "firebase/database";
 
 const WORKER_URL = (import.meta.env.VITE_WORKER_URL || "").replace(/\/$/, "");
@@ -175,6 +177,7 @@ function WatchParty() {
   const [messages, setMessages] = useState([]);
 
   const [chatInput, setChatInput] = useState("");
+  const [unreadChat, setUnreadChat] = useState(false);
 
   const [videoUrl, setVideoUrl] = useState("");
 
@@ -232,6 +235,8 @@ function WatchParty() {
 
   const roomJoinInProgressRef = useRef(false);
   const loadingCountRef = useRef(0);
+  const lastObservedMessageIdRef = useRef(null);
+  const unreadSidebarRef = useRef(leftCollapsed);
   // Firebase's serverTimeOffset keeps playback timestamps comparable across devices.
   const serverTimeOffsetRef = useRef(0);
   const getServerNow = () => Date.now() + serverTimeOffsetRef.current;
@@ -250,6 +255,34 @@ function WatchParty() {
     localStorage.setItem("wp-name", name);
 
   }, [name]);
+
+  useEffect(() => {
+    unreadSidebarRef.current = leftCollapsed;
+    if (!leftCollapsed) {
+      setUnreadChat(false);
+      if (messages.length) {
+        lastObservedMessageIdRef.current = messages[messages.length - 1].id;
+      }
+    }
+  }, [leftCollapsed, messages]);
+
+  useEffect(() => {
+    if (!joined || !messages.length) return;
+    const latest = messages[messages.length - 1];
+    const previousId = lastObservedMessageIdRef.current;
+    if (previousId === null) {
+      lastObservedMessageIdRef.current = latest.id;
+      return;
+    }
+    if (latest.id !== previousId) {
+      const previousIndex = messages.findIndex((message) => message.id === previousId);
+      const newMessages = previousIndex >= 0 ? messages.slice(previousIndex + 1) : [latest];
+      if (unreadSidebarRef.current && newMessages.some((message) => message.uid !== firebaseUser?.uid)) {
+        setUnreadChat(true);
+      }
+      lastObservedMessageIdRef.current = latest.id;
+    }
+  }, [messages, joined, firebaseUser]);
 
   // Firebase provides an estimated offset between this device's clock and
   // the database server clock. Both clients use that shared time reference.
@@ -407,24 +440,19 @@ function WatchParty() {
 
     const now = getServerNow();
 
+    const position =
+      video && Number.isFinite(video.currentTime) ? video.currentTime :
+      Number(latestStateRef.current?.position || 0);
     const state = {
-
       status,
-
-      position:
-
-        video && Number.isFinite(video.currentTime) ? video.currentTime : 0,
-
-      playbackRate: video?.playbackRate || 1,
-
+      position,
+      playbackRate: video?.playbackRate || latestStateRef.current?.playbackRate || 1,
       updatedAt: now,
-
       startAt: status === "playing" ? now : null,
-
+      lastPausedAt: status === "paused" ? now : latestStateRef.current?.lastPausedAt || null,
+      lastPausedPosition: status === "paused" ? position : latestStateRef.current?.lastPausedPosition ?? null,
       revision: now * 1000 + Math.floor(Math.random() * 1000),
-
       sender: clientIdRef.current,
-
     };
 
     latestStateRef.current = state;
@@ -551,6 +579,26 @@ function WatchParty() {
     }
 
   }, []);
+
+  // Periodically checkpoint the active publisher's playback position. This
+  // protects the resume point if every browser closes without an explicit leave.
+  useEffect(() => {
+    if (!joined || !playing) return undefined;
+    const timer = setInterval(() => {
+      if (
+        joinedRef.current &&
+        videoRef.current &&
+        !videoRef.current.paused &&
+        (
+          latestStateRef.current?.sender === clientIdRef.current ||
+          !memberList.some((member) => member.id === latestStateRef.current?.sender)
+        )
+      ) {
+        publishState("playing");
+      }
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [joined, playing, memberList, publishState]);
 
   const loadRemoteVideo = useCallback(async (media, user, targetRoom) => {
 
@@ -1111,12 +1159,36 @@ const metadataKey = getMetadataKey(video.key);
 
           : requestedRole;
 
+      const membersPath = `rooms/${normalized}/members`;
+      const existingMembersSnapshot = await get(ref(db, membersPath));
+      const existingMembers = existingMembersSnapshot.val() || {};
+      if (Object.keys(existingMembers).length === 0) {
+        const playbackRef = ref(db, `rooms/${normalized}/playback`);
+        const playbackSnapshot = await get(playbackRef);
+        const previousPlayback = playbackSnapshot.val();
+        if (previousPlayback?.status === "playing") {
+          const serverNow = getServerNow();
+          // No clients are connected now, so restore the last checkpoint rather
+          // than counting the offline interval as watched time.
+          const pausedPosition = Number(previousPlayback.position || 0);
+          const pausedState = {
+            ...previousPlayback,
+            status: "paused",
+            position: Math.max(0, pausedPosition),
+            updatedAt: serverNow,
+            startAt: null,
+            lastPausedAt: serverNow,
+            lastPausedPosition: Math.max(0, pausedPosition),
+            revision: serverNow * 1000 + Math.floor(Math.random() * 1000),
+            sender: clientIdRef.current,
+          };
+          await set(playbackRef, pausedState);
+        }
+      }
+
       const memberRef = ref(
-
         db,
-
         `rooms/${normalized}/members/${clientIdRef.current}`,
-
       );
 
       memberRefRef.current = memberRef;
@@ -1150,6 +1222,8 @@ const metadataKey = getMetadataKey(video.key);
       libraryItemsRef.current = [];
 
       setLibrary([]);
+      setUnreadChat(false);
+      lastObservedMessageIdRef.current = null;
 
       joinedRef.current = true;
 
@@ -1184,12 +1258,19 @@ const metadataKey = getMetadataKey(video.key);
         (snapshot) => {
 
           const value = snapshot.val() || {};
-
-          setMemberList(
-
-            Object.entries(value).map(([id, member]) => ({ id, ...member })),
-
-          );
+          const nextMembers = Object.entries(value).map(([id, member]) => ({ id, ...member }));
+          setMemberList(nextMembers);
+          const currentPlayback = latestStateRef.current;
+          if (
+            currentPlayback?.status === "playing" &&
+            currentPlayback.sender &&
+            !nextMembers.some((member) => member.id === currentPlayback.sender) &&
+            nextMembers.some((member) => member.id === clientIdRef.current) &&
+            videoRef.current &&
+            !videoRef.current.paused
+          ) {
+            publishState("playing");
+          }
 
         },
 
@@ -1443,6 +1524,57 @@ const metadataKey = getMetadataKey(video.key);
   const leaveRoom = async (goHome = true) => {
     if (goHome) beginLoading("Leaving room");
 
+    const leavingRoomId = currentRoomRef.current;
+    if (joinedRef.current && leavingRoomId) {
+      try {
+        const video = videoRef.current;
+        const previous = latestStateRef.current || {};
+        const now = getServerNow();
+        let position = video && Number.isFinite(video.currentTime)
+          ? video.currentTime
+          : Number(previous.position || 0);
+        if ((!video || !Number.isFinite(video.currentTime)) && previous.status === "playing") {
+          const start = Number(previous.startAt || previous.updatedAt || now);
+          position += (Math.max(0, now - start) / 1000) * Number(previous.playbackRate || 1);
+        }
+        const finalPosition = Math.max(0, position);
+        const membersResult = await runTransaction(
+          ref(db, `rooms/${leavingRoomId}/members`),
+          (members) => {
+            if (!members) return members;
+            const nextMembers = { ...members };
+            delete nextMembers[clientIdRef.current];
+            return nextMembers;
+          },
+        );
+        const remainingMembers = membersResult.snapshot.val() || {};
+        if (Object.keys(remainingMembers).length === 0) {
+          const playbackRef = ref(db, `rooms/${leavingRoomId}/playback`);
+          const oldPlayback = (await get(playbackRef)).val() || previous;
+          const pausedState = {
+            ...oldPlayback,
+            status: "paused",
+            position: finalPosition,
+            updatedAt: now,
+            startAt: null,
+            lastPausedAt: now,
+            lastPausedPosition: finalPosition,
+            revision: now * 1000 + Math.floor(Math.random() * 1000),
+            sender: clientIdRef.current,
+          };
+          await set(playbackRef, pausedState);
+          latestStateRef.current = pausedState;
+        }
+        if (video && !video.paused) {
+          applyingRemoteRef.current = true;
+          video.pause();
+          applyingRemoteRef.current = false;
+        }
+      } catch (error) {
+        console.warn("Could not save final room playback position:", error);
+      }
+    }
+
     joinedRef.current = false;
 
     currentRoomRef.current = "";
@@ -1626,7 +1758,7 @@ const metadataKey = getMetadataKey(video.key);
 
     .wp{min-height:100vh;color:#eeeef4}.topbar{height:68px;border-bottom:1px solid #ffffff12;background:#0b0b10dd;backdrop-filter:blur(18px);display:flex;align-items:center;justify-content:space-between;padding:0 28px;position:sticky;top:0;z-index:20}
 
-    .brand{display:flex;align-items:center;gap:10px;color:#f7f5ff;text-decoration:none;font-weight:850;letter-spacing:-.8px;font-size:21px}.brand-logo{width:36px;height:36px;display:block;object-fit:contain;flex:none}.accent{color:#a78bfa}.topright{display:flex;align-items:center;gap:12px;color:#a4a1b2;font-size:12px}.dot{width:7px;height:7px;border-radius:50%;background:#686575;display:inline-block}.dot.online{background:#4ade80;box-shadow:0 0 12px #4ade8080}.btn{border:1px solid #ffffff18;background:#ffffff0a;color:#eeeef4;border-radius:10px;padding:10px 13px;display:inline-flex;align-items:center;justify-content:center;gap:8px;font-size:13px;font-weight:650;transition:.18s}.btn:hover{background:#ffffff15;border-color:#ffffff35}.btn:disabled{opacity:.45;cursor:not-allowed}.btn.primary{background:#8155e8;border-color:#936df0;color:white}.btn.primary:hover{background:#936df0}.btn.icon{width:38px;height:38px;padding:0}.home{max-width:1120px;margin:0 auto;padding:clamp(38px,8vh,90px) 24px;display:grid;grid-template-columns:minmax(0,1fr) minmax(290px,370px);gap:54px;align-items:start}.home-main{padding-top:30px}.wordmark{font-size:clamp(42px,7vw,76px);line-height:1;font-weight:850;letter-spacing:-5px;margin:0 0 12px}.tagline{color:#a5a1b4;margin:0 0 38px;font-size:15px}.home-form{max-width:490px;display:grid;gap:13px}.field{display:grid;gap:7px}.field label{font-size:10px;letter-spacing:1.2px;font-weight:800;color:#a7a2b5}.field input,.chat-form input{background:#15141d;border:1px solid #ffffff17;border-radius:11px;padding:14px 15px;color:#f5f3ff;outline:none;width:100%}.field input:focus,.chat-form input:focus{border-color:#9b7af0;box-shadow:0 0 0 3px #8b5cf622}.home-actions{display:flex;gap:10px;margin-top:4px}.home-actions .btn{flex:1;min-height:45px}.create-room-separate{margin-top:25px;padding-top:19px;border-top:1px solid #ffffff16;display:flex;align-items:center;justify-content:space-between;gap:18px}.create-room-copy{display:grid;gap:5px;min-width:0}.create-room-copy strong{font-size:12px;color:#e9e5f2}.create-room-copy span{font-size:11px;color:#898597;line-height:1.45}.create-room-button{min-height:42px;flex:none;padding:10px 16px;border-color:#8b5cf655;background:#8b5cf615;color:#d8caff}.create-room-button:hover{background:#8b5cf629;border-color:#a78bfa}.rooms-panel{border:1px solid #ffffff14;background:#111119d9;border-radius:18px;overflow:hidden;box-shadow:0 25px 80px #0005}.panel-head{padding:18px 18px 14px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #ffffff10}.panel-head h3{font-size:14px;margin:0}.muted{color:#858194}.room-list{max-height:470px;overflow:auto;padding:8px}.room-link{width:100%;text-align:left;border:0;background:transparent;color:#eeeef4;border-radius:10px;padding:12px;display:flex;align-items:center;justify-content:space-between;gap:12px}.room-link:hover{background:#ffffff0b}.room-link strong{display:block;font-size:13px}.room-link small{display:block;color:#858194;font-size:11px;margin-top:4px}.empty-rooms{padding:28px 18px;text-align:center;color:#898597;font-size:12px;line-height:1.6}.notice{margin:14px 0 0;padding:11px 13px;border:1px solid #f59e0b33;background:#f59e0b0d;color:#f6ca82;border-radius:10px;font-size:12px;display:flex;gap:8px;align-items:flex-start;overflow-wrap:anywhere}.room-page{height:calc(100vh - 68px);min-height:520px;display:flex;flex-direction:column}.room-head{padding:13px 20px;display:flex;align-items:center;justify-content:space-between;gap:16px;border-bottom:1px solid #ffffff12}.room-title{min-width:0}.room-title .kicker{color:#8d879e;font-size:9px;font-weight:800;letter-spacing:1.3px;margin:0 0 4px}.room-title h1{font-size:18px;margin:0;letter-spacing:-.3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.room-title h1 span{color:#a78bfa}.room-actions{display:flex;align-items:center;gap:8px}.room-meta{display:flex;align-items:center;gap:12px;color:#9691a5;font-size:11px}.workspace{flex:1;min-height:0;display:flex;gap:0;padding:14px;overflow:hidden}.side{flex:0 0 260px;min-width:0;background:#111119;border:1px solid #ffffff12;border-radius:14px;display:flex;flex-direction:column;overflow:hidden;transition:flex-basis .22s ease,width .22s ease}.side.right{flex-basis:285px}.side.collapsed{flex-basis:54px}.side-section{display:flex;flex-direction:column;min-height:0;flex:1;padding:12px}.side-section+ .side-section{border-top:1px solid #ffffff12}.side-section.members{flex:0 0 48%}.side-section.chat{flex:1}.side.collapsed .side-section{align-items:center;padding:10px 6px}.side-head{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:12px;min-height:30px}.side-head h3{font-size:12px;margin:0;white-space:nowrap}.side.collapsed .side-head{justify-content:center}.collapse-btn{border:0;background:transparent;color:#9691a5;padding:5px;border-radius:7px;display:grid;place-items:center}.collapse-btn:hover{background:#ffffff12;color:white}.side.collapsed .side-content{display:none}.member-list,.video-list{overflow:auto;min-height:0;display:grid;align-content:start;gap:5px}.member{display:flex;align-items:center;gap:9px;padding:8px;border-radius:9px;background:#ffffff05}.avatar{width:28px;height:28px;border-radius:9px;background:#30254b;color:#c9b7ff;display:grid;place-items:center;font-size:11px;font-weight:800;flex:none}.member-name{min-width:0;flex:1}.member-name strong{font-size:11px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.member-name small{font-size:10px;color:#858194}.you{font-size:9px;color:#a78bfa}.chat-messages{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:11px;padding:2px 1px 10px}.chat-msg{font-size:11px;line-height:1.45;overflow-wrap:anywhere}.chat-msg .sender{color:#b8a1ff;font-weight:750;margin-right:5px}.chat-msg time{color:#686477;font-size:9px;margin-left:5px}.chat-form{display:flex;gap:6px;padding-top:8px;border-top:1px solid #ffffff10}.chat-form input{padding:10px;font-size:11px;min-width:0}.chat-form button{width:36px;flex:none;padding:0}.center{flex:1;min-width:0;display:flex;flex-direction:column;padding:0 12px;gap:10px}.player-wrap{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;background:#050507;border:1px solid #ffffff12;border-radius:14px;overflow:hidden;position:relative}.player-wrap video{width:100%;height:100%;max-height:100%;object-fit:contain;background:#000}.empty-player{padding:30px;text-align:center;max-width:390px}.empty-player .upload-symbol{width:58px;height:58px;border-radius:18px;background:#8b5cf622;color:#bba5ff;display:grid;place-items:center;margin:0 auto 17px}.empty-player h2{font-size:18px;margin:0 0 8px}.empty-player p{font-size:12px;line-height:1.6;color:#8f8a9e;margin:0 0 17px}.player-caption{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#9994a8;font-size:11px;min-height:32px}.player-caption strong{color:#e9e5f2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.upload-progress{height:4px;background:#ffffff14;border-radius:10px;overflow:hidden}.upload-progress>span{height:100%;display:block;background:#9b7af0}.side.right .side-section{flex:1}.video-item{width:100%;border:1px solid transparent;background:#ffffff05;color:#eeeef4;text-align:left;padding:9px;border-radius:10px;display:flex;align-items:center;gap:9px}.video-item:hover{background:#ffffff0d}.video-item.active{background:#8b5cf61b;border-color:#8b5cf655}.video-icon{width:38px;height:34px;display:grid;place-items:center;background:#24212e;border-radius:7px;color:#b7a1ff;flex:none}.video-info{min-width:0;max-width:100%;flex:1;overflow:hidden}.video-info strong{display:block;max-width:100%;min-width:0;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.video-info small{display:block;color:#858194;font-size:9px;margin-top:4px}.video-row{display:flex;align-items:center;gap:3px;min-width:0;border:1px solid transparent;border-radius:10px;background:#ffffff05;padding-right:4px}.video-row.active{background:#8b5cf61b;border-color:#8b5cf655}.video-row .video-item{flex:1;min-width:0;background:transparent;border:0;padding:8px 5px}.video-row .video-item:hover{background:transparent}.video-actions{display:flex;align-items:center;gap:1px;flex:none}.video-actions .collapse-btn{padding:5px}.danger-action{color:#d88b91}.danger-action:hover{color:#ff9ca5;background:#ff536015}.selected-label{color:#bba5ff;font-size:9px}.side-empty{padding:24px 8px;text-align:center;color:#777286;font-size:11px;line-height:1.6}.side-empty svg{display:block;margin:0 auto 9px}.collapsed-rail{display:none}.side.collapsed .collapsed-rail{display:flex;flex-direction:column;gap:14px;align-items:center;color:#a69db9;padding-top:8px}.footerline{padding:7px 18px;color:#6f6a7e;font-size:10px;border-top:1px solid #ffffff0c;display:flex;justify-content:space-between}.mobile-label{display:none}
+    .brand{display:flex;align-items:center;gap:10px;color:#f7f5ff;text-decoration:none;font-weight:850;letter-spacing:-.8px;font-size:21px}.brand-logo{width:36px;height:36px;display:block;object-fit:contain;flex:none}.accent{color:#a78bfa}.topright{display:flex;align-items:center;gap:12px;color:#a4a1b2;font-size:12px}.dot{width:7px;height:7px;border-radius:50%;background:#686575;display:inline-block}.dot.online{background:#4ade80;box-shadow:0 0 12px #4ade8080}.btn{border:1px solid #ffffff18;background:#ffffff0a;color:#eeeef4;border-radius:10px;padding:10px 13px;display:inline-flex;align-items:center;justify-content:center;gap:8px;font-size:13px;font-weight:650;transition:.18s}.btn:hover{background:#ffffff15;border-color:#ffffff35}.btn:disabled{opacity:.45;cursor:not-allowed}.btn.primary{background:#8155e8;border-color:#936df0;color:white}.btn.primary:hover{background:#936df0}.btn.icon{width:38px;height:38px;padding:0}.home{max-width:1120px;margin:0 auto;padding:clamp(38px,8vh,90px) 24px;display:grid;grid-template-columns:minmax(0,1fr) minmax(290px,370px);gap:54px;align-items:start}.home-main{padding-top:30px}.wordmark{font-size:clamp(42px,7vw,76px);line-height:1;font-weight:850;letter-spacing:-5px;margin:0 0 12px}.tagline{color:#a5a1b4;margin:0 0 38px;font-size:15px}.home-form{max-width:490px;display:grid;gap:13px}.field{display:grid;gap:7px}.field label{font-size:10px;letter-spacing:1.2px;font-weight:800;color:#a7a2b5}.field input,.chat-form input{background:#15141d;border:1px solid #ffffff17;border-radius:11px;padding:14px 15px;color:#f5f3ff;outline:none;width:100%}.field input:focus,.chat-form input:focus{border-color:#9b7af0;box-shadow:0 0 0 3px #8b5cf622}.home-actions{display:flex;gap:10px;margin-top:4px}.home-actions .btn{flex:1;min-height:45px}.create-room-separate{margin-top:25px;padding-top:19px;border-top:1px solid #ffffff16;display:flex;align-items:center;justify-content:space-between;gap:18px}.create-room-copy{display:grid;gap:5px;min-width:0}.create-room-copy strong{font-size:12px;color:#e9e5f2}.create-room-copy span{font-size:11px;color:#898597;line-height:1.45}.create-room-button{min-height:42px;flex:none;padding:10px 16px;border-color:#8b5cf655;background:#8b5cf615;color:#d8caff}.create-room-button:hover{background:#8b5cf629;border-color:#a78bfa}.rooms-panel{border:1px solid #ffffff14;background:#111119d9;border-radius:18px;overflow:hidden;box-shadow:0 25px 80px #0005}.panel-head{padding:18px 18px 14px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #ffffff10}.panel-head h3{font-size:14px;margin:0}.muted{color:#858194}.room-list{max-height:470px;overflow:auto;padding:8px}.room-link{width:100%;text-align:left;border:0;background:transparent;color:#eeeef4;border-radius:10px;padding:12px;display:flex;align-items:center;justify-content:space-between;gap:12px}.room-link:hover{background:#ffffff0b}.room-link strong{display:block;font-size:13px}.room-link small{display:block;color:#858194;font-size:11px;margin-top:4px}.empty-rooms{padding:28px 18px;text-align:center;color:#898597;font-size:12px;line-height:1.6}.notice{margin:14px 0 0;padding:11px 13px;border:1px solid #f59e0b33;background:#f59e0b0d;color:#f6ca82;border-radius:10px;font-size:12px;display:flex;gap:8px;align-items:flex-start;overflow-wrap:anywhere}.room-page{height:calc(100vh - 68px);min-height:520px;display:flex;flex-direction:column}.room-head{padding:13px 20px;display:flex;align-items:center;justify-content:space-between;gap:16px;border-bottom:1px solid #ffffff12}.room-title{min-width:0}.room-title .kicker{color:#8d879e;font-size:9px;font-weight:800;letter-spacing:1.3px;margin:0 0 4px}.room-title h1{font-size:18px;margin:0;letter-spacing:-.3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.room-title h1 span{color:#a78bfa}.room-actions{display:flex;align-items:center;gap:8px}.room-meta{display:flex;align-items:center;gap:12px;color:#9691a5;font-size:11px}.workspace{flex:1;min-height:0;display:flex;gap:0;padding:14px;overflow:hidden}.side{flex:0 0 260px;min-width:0;background:#111119;border:1px solid #ffffff12;border-radius:14px;display:flex;flex-direction:column;overflow:hidden;transition:flex-basis .22s ease,width .22s ease}.side.right{flex-basis:285px}.side.collapsed{flex-basis:54px}.side-section{display:flex;flex-direction:column;min-height:0;flex:1;padding:12px}.side-section+ .side-section{border-top:1px solid #ffffff12}.side-section.members{flex:0 0 48%}.side-section.chat{flex:1}.side.collapsed .side-section{align-items:center;padding:10px 6px}.side-head{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:12px;min-height:30px}.side-head h3{font-size:12px;margin:0;white-space:nowrap}.side.collapsed .side-head{justify-content:center}.collapse-btn{border:0;background:transparent;color:#9691a5;padding:5px;border-radius:7px;display:grid;place-items:center}.collapse-btn:hover{background:#ffffff12;color:white}.side.collapsed .side-content{display:none}.member-list,.video-list{overflow:auto;min-height:0;display:grid;align-content:start;gap:5px}.member{display:flex;align-items:center;gap:9px;padding:8px;border-radius:9px;background:#ffffff05}.avatar{width:28px;height:28px;border-radius:9px;background:#30254b;color:#c9b7ff;display:grid;place-items:center;font-size:11px;font-weight:800;flex:none}.member-name{min-width:0;flex:1}.member-name strong{font-size:11px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.member-name small{font-size:10px;color:#858194}.you{font-size:9px;color:#a78bfa}.chat-messages{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:11px;padding:2px 1px 10px}.chat-icon-wrap{position:relative;display:inline-flex;align-items:center;justify-content:center}.chat-unread-dot{position:absolute;right:-4px;top:-4px;width:8px;height:8px;border-radius:50%;background:#ef4444;box-shadow:0 0 0 2px #111119}.chat-msg{font-size:11px;line-height:1.45;overflow-wrap:anywhere}.chat-msg .sender{color:#b8a1ff;font-weight:750;margin-right:5px}.chat-msg time{color:#686477;font-size:9px;margin-left:5px}.chat-form{display:flex;gap:6px;padding-top:8px;border-top:1px solid #ffffff10}.chat-form input{padding:10px;font-size:11px;min-width:0}.chat-form button{width:36px;flex:none;padding:0}.center{flex:1;min-width:0;display:flex;flex-direction:column;padding:0 12px;gap:10px}.player-wrap{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;background:#050507;border:1px solid #ffffff12;border-radius:14px;overflow:hidden;position:relative}.player-wrap video{width:100%;height:100%;max-height:100%;object-fit:contain;background:#000}.empty-player{padding:30px;text-align:center;max-width:390px}.empty-player .upload-symbol{width:58px;height:58px;border-radius:18px;background:#8b5cf622;color:#bba5ff;display:grid;place-items:center;margin:0 auto 17px}.empty-player h2{font-size:18px;margin:0 0 8px}.empty-player p{font-size:12px;line-height:1.6;color:#8f8a9e;margin:0 0 17px}.player-caption{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#9994a8;font-size:11px;min-height:32px}.player-caption strong{color:#e9e5f2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.upload-progress{height:4px;background:#ffffff14;border-radius:10px;overflow:hidden}.upload-progress>span{height:100%;display:block;background:#9b7af0}.side.right .side-section{flex:1}.video-item{width:100%;border:1px solid transparent;background:#ffffff05;color:#eeeef4;text-align:left;padding:9px;border-radius:10px;display:flex;align-items:center;gap:9px}.video-item:hover{background:#ffffff0d}.video-item.active{background:#8b5cf61b;border-color:#8b5cf655}.video-icon{width:38px;height:34px;display:grid;place-items:center;background:#24212e;border-radius:7px;color:#b7a1ff;flex:none}.video-info{min-width:0;max-width:100%;flex:1;overflow:hidden}.video-info strong{display:block;max-width:100%;min-width:0;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.video-info small{display:block;color:#858194;font-size:9px;margin-top:4px}.video-row{display:flex;align-items:center;gap:3px;min-width:0;border:1px solid transparent;border-radius:10px;background:#ffffff05;padding-right:4px}.video-row.active{background:#8b5cf61b;border-color:#8b5cf655}.video-row .video-item{flex:1;min-width:0;background:transparent;border:0;padding:8px 5px}.video-row .video-item:hover{background:transparent}.video-actions{display:flex;align-items:center;gap:1px;flex:none}.video-actions .collapse-btn{padding:5px}.danger-action{color:#d88b91}.danger-action:hover{color:#ff9ca5;background:#ff536015}.selected-label{color:#bba5ff;font-size:9px}.side-empty{padding:24px 8px;text-align:center;color:#777286;font-size:11px;line-height:1.6}.side-empty svg{display:block;margin:0 auto 9px}.collapsed-rail{display:none}.side.collapsed .collapsed-rail{display:flex;flex-direction:column;gap:14px;align-items:center;color:#a69db9;padding-top:8px}.footerline{padding:7px 18px;color:#6f6a7e;font-size:10px;border-top:1px solid #ffffff0c;display:flex;justify-content:space-between}.mobile-label{display:none}
 
     @media(max-width:900px){.side{flex-basis:220px}.side.right{flex-basis:230px}.side.collapsed,.side.right.collapsed{flex-basis:48px}.workspace{padding:9px}.center{padding:0 8px}}
 
@@ -2131,13 +2263,10 @@ const metadataKey = getMetadataKey(video.key);
 
                     <h3>
 
-                      <MessageCircle
-
-                        size={14}
-
-                        style={{ verticalAlign: "-3px", marginRight: 6 }}
-
-                      />
+                      <span className="chat-icon-wrap" style={{ marginRight: 6, verticalAlign: "-3px" }}>
+                        <MessageCircle size={14} />
+                        {unreadChat && <span className="chat-unread-dot" />}
+                      </span>
 
                       Room chat
 
@@ -2244,8 +2373,10 @@ const metadataKey = getMetadataKey(video.key);
                 </button>
 
                 <Users size={18} />
-
-                <MessageCircle size={18} />
+                <span className="chat-icon-wrap" title={unreadChat ? "Unread messages" : "Room chat"}>
+                  <MessageCircle size={18} />
+                  {unreadChat && <span className="chat-unread-dot" />}
+                </span>
 
               </div>
 

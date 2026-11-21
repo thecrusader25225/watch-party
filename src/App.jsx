@@ -232,6 +232,10 @@ function WatchParty() {
 
   const roomJoinInProgressRef = useRef(false);
   const loadingCountRef = useRef(0);
+  // Firebase's serverTimeOffset keeps playback timestamps comparable across devices.
+  const serverTimeOffsetRef = useRef(0);
+  const getServerNow = () => Date.now() + serverTimeOffsetRef.current;
+
   const beginLoading = useCallback((label) => {
     loadingCountRef.current += 1;
     setLoadingMessage(label);
@@ -246,6 +250,21 @@ function WatchParty() {
     localStorage.setItem("wp-name", name);
 
   }, [name]);
+
+  // Firebase provides an estimated offset between this device's clock and
+  // the database server clock. Both clients use that shared time reference.
+  useEffect(() => {
+    if (!isFirebaseConfigured) return undefined;
+
+    const stop = onValue(
+      ref(db, ".info/serverTimeOffset"),
+      (snapshot) => {
+        serverTimeOffsetRef.current = Number(snapshot.val() || 0);
+      },
+    );
+
+    return stop;
+  }, []);
 
   useEffect(() => {
 
@@ -386,7 +405,7 @@ function WatchParty() {
 
       statusOverride || (video && !video.paused ? "playing" : "paused");
 
-    const now = Date.now();
+    const now = getServerNow();
 
     const state = {
 
@@ -400,7 +419,7 @@ function WatchParty() {
 
       updatedAt: now,
 
-      startAt: status === "playing" ? now + 700 : null,
+      startAt: status === "playing" ? now : null,
 
       revision: now * 1000 + Math.floor(Math.random() * 1000),
 
@@ -452,20 +471,17 @@ function WatchParty() {
 
     let target = Number(state.position || 0);
 
+    const playbackRate = Number(state.playbackRate || 1);
+    const serverNow = getServerNow();
+    const playbackStart = Number(
+      state.startAt || state.updatedAt || serverNow,
+    );
+
     if (state.status === "playing") {
-
-      const referenceTime = Number(
-
-        state.updatedAt || state.startAt || Date.now(),
-
-      );
-
+      // position is the position at playbackStart, not updatedAt.
+      // Never use the receiver's raw device clock for this calculation.
       target +=
-
-        (Math.max(0, Date.now() - referenceTime) / 1000) *
-
-        Number(state.playbackRate || 1);
-
+        (Math.max(0, serverNow - playbackStart) / 1000) * playbackRate;
     }
 
     if (Number.isFinite(video.duration))
@@ -482,7 +498,7 @@ function WatchParty() {
 
         video.currentTime = target;
 
-      video.playbackRate = Number(state.playbackRate || 1);
+      video.playbackRate = playbackRate;
 
       if (state.status === "playing") {
 
@@ -512,7 +528,7 @@ function WatchParty() {
 
           },
 
-          Math.max(0, Number(state.startAt || 0) - Date.now()),
+          Math.max(0, playbackStart - getServerNow()),
 
         );
 

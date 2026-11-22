@@ -869,9 +869,16 @@ const metadataKey = getMetadataKey(video.key);
 
     if (role !== "host") return setNotice("Only the host can upload a video.");
 
-    if (!selected.type.startsWith("video/"))
+    const fileExtension = selected.name.split(".").pop()?.toLowerCase() || "";
+    const supportedVideoExtensions = new Set([
+      "mp4", "m4v", "webm", "ogv", "mov", "mkv", "avi", "mpeg", "mpg", "3gp",
+    ]);
+    const isVideoFile =
+      selected.type.startsWith("video/") ||
+      supportedVideoExtensions.has(fileExtension);
 
-      return setNotice("Please choose a video file.");
+    if (!isVideoFile)
+      return setNotice("Please choose a supported video file (including MKV).");
 
     if (selected.size > MAX_UPLOAD_SIZE)
 
@@ -894,7 +901,22 @@ const metadataKey = getMetadataKey(video.key);
 
       const token = await firebaseUser.getIdToken();
 
-      const contentType = selected.type || "video/mp4";
+      const mimeByExtension = {
+        mkv: "video/x-matroska",
+        avi: "video/x-msvideo",
+        mov: "video/quicktime",
+        webm: "video/webm",
+        mp4: "video/mp4",
+        m4v: "video/x-m4v",
+        ogv: "video/ogg",
+        mpeg: "video/mpeg",
+        mpg: "video/mpeg",
+        "3gp": "video/3gpp",
+      };
+      const contentType =
+        selected.type.startsWith("video/")
+          ? selected.type
+          : mimeByExtension[fileExtension] || "application/octet-stream";
 
       const response = await fetch(`${WORKER_URL}/upload-url`, {
 

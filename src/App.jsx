@@ -2511,43 +2511,17 @@ const metadataKey = getMetadataKey(video.key);
                 <div className="empty-player">
 
                   <div className="upload-symbol">
-
-                    {role === "host" ? (
-
                       <Upload size={25} />
-
-                    ) : (
-
-                      <Cloud size={25} />
-
-                    )}
-
                   </div>
 
                   <h2>
-
-                    {role === "host"
-
-                      ? "Add a video to the room"
-
-                      : "Waiting for a video"}
-
+                Add a video to the room
                   </h2>
 
                   <p>
-
-                    {role === "host"
-
-                      ? "Upload once. Everyone in this room can stream it."
-
-                      : "Choose a video from the library when the host adds one."}
-
+                    Upload once. Everyone in this room can stream it.
                   </p>
-
-                  {role === "host" && (
-
                     <button
-
                       className="btn primary"
 
                       onClick={() => fileInputRef.current?.click()}
@@ -2561,9 +2535,6 @@ const metadataKey = getMetadataKey(video.key);
                       {uploading ? "Uploading…" : "Upload video"}
 
                     </button>
-
-                  )}
-
                 </div>
 
               )}
@@ -2694,8 +2665,6 @@ const metadataKey = getMetadataKey(video.key);
 
                   <div style={{ display: "flex", gap: 4 }}>
 
-                    {role === "host" && (
-
                       <button
                         className="btn"
                         style={{ padding: "6px 8px", fontSize: 10, gap: 5 }}
@@ -2706,8 +2675,6 @@ const metadataKey = getMetadataKey(video.key);
                         <Plus size={13} />
                         Add video
                       </button>
-
-                    )}
 
                     <button
 
@@ -2750,7 +2717,7 @@ const metadataKey = getMetadataKey(video.key);
                           <Play size={14} />
                         )}
                       </button>
-                      {role === "host" && (
+                      
                         <div className="video-actions">
                           <button
                             className="collapse-btn"
@@ -2769,7 +2736,7 @@ const metadataKey = getMetadataKey(video.key);
                             <Trash2 size={13} />
                           </button>
                         </div>
-                      )}
+                      
                     </div>
                   ))}
 

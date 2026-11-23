@@ -867,8 +867,6 @@ const metadataKey = getMetadataKey(video.key);
 
     if (!selected || !currentRoomRef.current || !firebaseUser) return;
 
-    if (role !== "host") return setNotice("Only the host can upload a video.");
-
     const fileExtension = selected.name.split(".").pop()?.toLowerCase() || "";
     const supportedVideoExtensions = new Set([
       "mp4", "m4v", "webm", "ogv", "mov", "mkv", "avi", "mpeg", "mpg", "3gp",
@@ -1057,7 +1055,6 @@ const metadataKey = getMetadataKey(video.key);
 
 
   const renameLibraryVideo = async (item) => {
-    if (role !== "host") return setNotice("Only the host can rename videos.");
     const nextName = window.prompt("Rename video", item.name || "");
     if (nextName === null) return;
     const cleanName = nextName.trim();
@@ -1089,7 +1086,6 @@ const metadataKey = getMetadataKey(video.key);
   };
 
   const deleteLibraryVideo = async (item) => {
-    if (role !== "host") return setNotice("Only the host can delete videos.");
     const confirmed = window.confirm(
       `Delete "${item.name}" from this room? This permanently removes the uploaded file.`
     );

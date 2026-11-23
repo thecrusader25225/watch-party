@@ -2511,16 +2511,23 @@ const metadataKey = getMetadataKey(video.key);
                 <div className="empty-player">
 
                   <div className="upload-symbol">
+
                       <Upload size={25} />
+
                   </div>
 
                   <h2>
-                Add a video to the room
+                    Add a video to the room
+
                   </h2>
 
                   <p>
+
                     Upload once. Everyone in this room can stream it.
+
                   </p>
+
+
                     <button
                       className="btn primary"
 
@@ -2535,6 +2542,7 @@ const metadataKey = getMetadataKey(video.key);
                       {uploading ? "Uploading…" : "Upload video"}
 
                     </button>
+
                 </div>
 
               )}
@@ -2665,6 +2673,7 @@ const metadataKey = getMetadataKey(video.key);
 
                   <div style={{ display: "flex", gap: 4 }}>
 
+                   
                       <button
                         className="btn"
                         style={{ padding: "6px 8px", fontSize: 10, gap: 5 }}
